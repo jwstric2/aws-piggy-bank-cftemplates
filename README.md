@@ -1,2 +1,2 @@
-# cloud-formation-templates
-Some useful cost saving cloud formation templates
+# aws-piggy-bank-cftemplates
+Some useful cost saving cloud formation templates.
