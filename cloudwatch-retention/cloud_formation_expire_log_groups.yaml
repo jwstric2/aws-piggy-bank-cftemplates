@@ -1,0 +1,162 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This CloudFormation template enables a Lambda function that will enforce "Expire Events After" for all cloudwatch log groups.
+Parameters:
+  ExpireEventsAfter:
+    Description: Enter the desired number of days before the logs can expire.
+    Default: 14
+    AllowedValues:
+      - 180
+      - 120
+      - 60
+      - 30
+      - 14
+      - 7
+    Type: Number
+
+
+  LambdaRate:
+    Description: >
+      The Cron expressions (frequency) that determines when CloudWatch Events runs the rule that
+      triggers the Lambda function.
+    Default: cron(0 0 * * ? *)
+    AllowedValues:
+      - cron(0 0 * * ? *)
+      - cron(0 0 ? * SUN *)
+      - cron(0 0 1 * ? *)
+    Type: String
+
+
+Resources:
+  IAMRoleCreation:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cloudwatch-log-expiration-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+
+  IAMRoleCreationPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: "cloudwatch-lambda-update-expiration"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "logs:DescribeLogGroups"
+              - "logs:PutRetentionPolicy"
+              - "logs:ListTagsLogGroup"
+            Resource: "*"
+      Roles:
+        -
+          Ref: "IAMRoleCreation"
+
+
+  LambdaSchedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: >
+        A schedule for the Lambda function..
+      ScheduleExpression: !Ref LambdaRate
+      State: ENABLED
+      Targets:
+        - Arn: !Sub ${LambdaFunction.Arn}
+          Id: LambdaSchedule
+
+
+  LambdaSchedulePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaSchedule.Arn}
+
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt IAMRoleCreation.Arn
+      Runtime: python3.7
+      Environment:
+        Variables:
+          ExpireEventsAfter:
+            Ref: ExpireEventsAfter
+      Code:
+        ZipFile: |
+          import os
+
+          import boto3
+
+          # --------------------------------------------------------------
+          # Setting log expiration value for all CloudWatch log groups.
+          # --------------------------------------------------------------
+
+
+          def lambda_handler(event, context):
+              client = boto3.client('logs')
+              marker = None
+              page = None
+              counter = 0
+              counter_modified = 0
+              # This returns a max of 50, thus we need to use a paginator
+              # log_groups = client.describe_log_groups()
+              while True:
+                  paginator = client.get_paginator('describe_log_groups')
+                  iterator = paginator.paginate(
+                      PaginationConfig={
+                          'PageSize': 10,
+                          'StartingToken': marker})
+                  for page in iterator:
+                      for i in page['logGroups']:
+                          counter += 1
+                          log_group_name = i['logGroupName']
+
+                          # Should we modify this log group?  We get the tag
+                          # then check to see if there is a SkipModifyRetention tag
+                          log_group_tags = client.list_tags_log_group(
+                              logGroupName=log_group_name
+                          )
+                          modify_log_group = True
+                          for key, value in log_group_tags['tags'].items():
+                              if key == "SkipModifyRetention" and value == "True":
+                                  modify_log_group = False
+                                  break
+
+                          if modify_log_group:
+                              print(f'Modifying log group {log_group_name}')
+                              response = client.put_retention_policy(
+                                  logGroupName=log_group_name,
+                                  retentionInDays=int(os.environ['ExpireEventsAfter'])
+                              )
+                              counter_modified += 1
+                          else:
+                              print(f'Skipping modification of log group {log_group_name} due to tag SkipModifyRetention == True')
+
+                  try:
+                      # Set the last page as the starting marker next go round
+                      marker = page['Marker']
+                      print(marker)
+                  except KeyError:
+                      break
+
+              print(f'total logGroups checked: {counter}')
+              print(f'total logGroups modified: {counter_modified}')
+              print("cloudwatch-lambda-update-expiration: ", os.environ['ExpireEventsAfter'])
+
+      Description: This Lambda function will enforce "Expire Events After" for all cloudwatch log groups.
+      FunctionName: cloudwatch-log-expiration
+      Timeout: 60
